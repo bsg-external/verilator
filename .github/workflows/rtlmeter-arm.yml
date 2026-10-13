@@ -254,7 +254,8 @@ jobs:
               {
                 echo "### $tag: $step"
                 echo '```'
-                head -c 60000 "compare-$tag-$step.txt"
+                # GitHub discards a step summary over 1 MiB; 9 tables of at most 110 kB stay under it
+                head -c 110000 "compare-$tag-$step.txt"
                 echo '```'
               } >> "$GITHUB_STEP_SUMMARY"
             done
