@@ -1,0 +1,272 @@
+---
+# DESCRIPTION: Github actions config
+# SPDX-License-Identifier: LGPL-3.0-only OR Artistic-2.0
+#
+# FORK-ONLY FILE: runs RTLMeter on GitHub's Arm runners for one upstream
+# commit (usually a PR head), plus that commit's merge-base with upstream
+# master as the reference, on the same machines, then compares the two.
+#
+# Started by poll-upstream-prs.yml, or by hand from the Actions tab.
+# Builds use arm-build.yml; the benchmark jobs use upstream's
+# reusable-rtlmeter-run.yml unchanged.
+#
+# Optional repository variable: ARM_RUNNER (default 'ubuntu-26.04-arm').
+
+name: RTLMeter Arm
+
+# The poller looks for the commit SHA in this title to skip measured commits
+run-name: >-
+  RTLMeter Arm ${{ inputs.pr && format('PR #{0} ', inputs.pr) || '' }}${{ inputs.sha || 'upstream master' }}${{ inputs.quick && ' (quick)' || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Upstream commit SHA to measure (blank: latest upstream master)"
+        type: string
+        default: ""
+      pr:
+        description: "Upstream PR number, if any (uses the smaller PR case set)"
+        type: string
+        default: ""
+      compare:
+        description: "Also measure the merge-base with upstream master, for comparison"
+        type: boolean
+        default: true
+      quick:
+        description: "Smoke test: only the shortest case per configuration"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  # Never measure the same commit twice at once
+  group: rtlmeter-arm-${{ inputs.sha || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  start:
+    name: Start
+    runs-on: ubuntu-latest
+    outputs:
+      new-sha: ${{ steps.shas.outputs.new-sha }}
+      old-sha: ${{ steps.shas.outputs.old-sha }}
+      cases: ${{ steps.cases.outputs.cases }}
+    steps:
+      - name: Checkout upstream Verilator
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          repository: verilator/verilator
+          ref: ${{ inputs.sha || 'master' }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve commits
+        id: shas
+        run: |
+          NEW_SHA="$(git rev-parse HEAD)"
+          echo "new-sha=$NEW_SHA" >> "$GITHUB_OUTPUT"
+          if [ "${{ inputs.compare }}" != "false" ]; then
+            OLD_SHA="$(git merge-base HEAD origin/master)"
+            if [ "$OLD_SHA" != "$NEW_SHA" ]; then
+              echo "old-sha=$OLD_SHA" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+          echo "New: $NEW_SHA  Reference: ${OLD_SHA:-none}"
+
+      - name: Load RTLMeter cases
+        id: cases
+        run: |
+          EVENT="${{ inputs.pr && 'pull_request' || 'workflow_dispatch' }}"
+          QUICK="${{ inputs.quick && '--ci-testing' || '' }}"
+          # shellcheck disable=SC2086
+          echo "cases=$(python3 ci/ci-rtlmeter-cases.py --event-name "$EVENT" $QUICK)" >> "$GITHUB_OUTPUT"
+
+  build-gcc-new:
+    name: Build New Verilator - GCC
+    needs: start
+    uses: ./.github/workflows/arm-build.yml
+    with:
+      cc: gcc
+      ccwarn: false
+      install: true
+      runs-on: ${{ vars.ARM_RUNNER || 'ubuntu-26.04-arm' }}
+      sha: ${{ needs.start.outputs.new-sha }}
+
+  build-clang-new:
+    name: Build New Verilator - Clang
+    needs: start
+    uses: ./.github/workflows/arm-build.yml
+    with:
+      cc: clang
+      ccwarn: false
+      install: true
+      runs-on: ${{ vars.ARM_RUNNER || 'ubuntu-26.04-arm' }}
+      sha: ${{ needs.start.outputs.new-sha }}
+
+  build-gcc-old:
+    name: Build Old Verilator - GCC
+    needs: start
+    if: ${{ needs.start.outputs.old-sha != '' }}
+    uses: ./.github/workflows/arm-build.yml
+    with:
+      cc: gcc
+      ccwarn: false
+      install: true
+      runs-on: ${{ vars.ARM_RUNNER || 'ubuntu-26.04-arm' }}
+      sha: ${{ needs.start.outputs.old-sha }}
+
+  build-clang-old:
+    name: Build Old Verilator - Clang
+    needs: start
+    if: ${{ needs.start.outputs.old-sha != '' }}
+    uses: ./.github/workflows/arm-build.yml
+    with:
+      cc: clang
+      ccwarn: false
+      install: true
+      runs-on: ${{ vars.ARM_RUNNER || 'ubuntu-26.04-arm' }}
+      sha: ${{ needs.start.outputs.old-sha }}
+
+  run-gcc:
+    name: Run GCC | ${{ matrix.cases }}
+    needs: [start, build-gcc-new, build-gcc-old]
+    if: ${{ !failure() && !cancelled() && needs.start.result == 'success' }}
+    uses: ./.github/workflows/reusable-rtlmeter-run.yml
+    with:
+      tag: gcc
+      runs-on: ${{ vars.ARM_RUNNER || 'ubuntu-26.04-arm' }}
+      cc: gcc
+      verilator-archive-new: ${{ needs.build-gcc-new.outputs.archive }}
+      verilator-archive-old: ${{ needs.build-gcc-old.outputs.archive }}
+      cases: ${{ matrix.cases }}
+      run-name: "gcc"
+      compileArgs: ""
+      executeArgs: ""
+    strategy:
+      fail-fast: false
+      max-parallel: 7
+      matrix:
+        cases: ${{ fromJSON(needs.start.outputs.cases)['gcc'] }}
+
+  run-clang:
+    name: Run Clang | ${{ matrix.cases }}
+    needs: [start, build-clang-new, build-clang-old]
+    if: ${{ !failure() && !cancelled() && needs.start.result == 'success' }}
+    uses: ./.github/workflows/reusable-rtlmeter-run.yml
+    with:
+      tag: clang
+      runs-on: ${{ vars.ARM_RUNNER || 'ubuntu-26.04-arm' }}
+      cc: clang
+      verilator-archive-new: ${{ needs.build-clang-new.outputs.archive }}
+      verilator-archive-old: ${{ needs.build-clang-old.outputs.archive }}
+      cases: ${{ matrix.cases }}
+      run-name: "clang --threads 4"
+      compileArgs: "--threads 4"
+      executeArgs: ""
+    strategy:
+      fail-fast: false
+      max-parallel: 7
+      matrix:
+        cases: ${{ fromJSON(needs.start.outputs.cases)['clang'] }}
+
+  run-gcc-hier:
+    name: Run GCC hier | ${{ matrix.cases }}
+    needs: [start, build-gcc-new, build-gcc-old]
+    if: ${{ !failure() && !cancelled() && needs.start.result == 'success' }}
+    uses: ./.github/workflows/reusable-rtlmeter-run.yml
+    with:
+      tag: gcc-hier
+      runs-on: ${{ vars.ARM_RUNNER || 'ubuntu-26.04-arm' }}
+      cc: gcc
+      verilator-archive-new: ${{ needs.build-gcc-new.outputs.archive }}
+      verilator-archive-old: ${{ needs.build-gcc-old.outputs.archive }}
+      cases: ${{ matrix.cases }}
+      run-name: "gcc --hierarchical"
+      compileArgs: "--hierarchical"
+      executeArgs: ""
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        cases: ${{ fromJSON(needs.start.outputs.cases)['gcc-hier'] }}
+
+  combine-results:
+    name: Combine and compare results
+    needs: [start, run-gcc, run-clang, run-gcc-hier]
+    # Collate whatever finished, even if some cases failed
+    if: ${{ !cancelled() && needs.start.result == 'success' }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAGS: "gcc clang gcc-hier"
+      HAS_REF: ${{ needs.start.outputs.old-sha != '' }}
+    steps:
+      - name: Checkout RTLMeter
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          repository: "verilator/rtlmeter"
+          path: rtlmeter
+          persist-credentials: false
+
+      - name: Setup RTLMeter venv
+        working-directory: rtlmeter
+        run: make venv
+
+      - name: Download and collate results
+        run: |
+          kinds="results"
+          [ "$HAS_REF" = "true" ] && kinds="results reference"
+          for kind in $kinds; do
+            for tag in $TAGS; do
+              mkdir -p artifacts "all-$kind-$tag"
+              gh run download ${{ github.run_id }} --pattern "rtlmeter-$tag-$kind-*" --dir artifacts || true
+              find artifacts -name "*.json" -exec mv {} "all-$kind-$tag/" \;
+              rm -rf artifacts
+              if ls "all-$kind-$tag"/*.json > /dev/null 2>&1; then
+                (cd rtlmeter && ./rtlmeter collate "../all-$kind-$tag"/*.json) > "all-$kind-$tag.json"
+              fi
+            done
+          done
+
+      - name: Compare new against reference
+        if: ${{ env.HAS_REF == 'true' }}
+        run: |
+          {
+            echo "## RTLMeter Arm: ${{ needs.start.outputs.new-sha }}"
+            echo "Reference (merge-base): ${{ needs.start.outputs.old-sha }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for tag in $TAGS; do
+            if [ ! -f "all-results-$tag.json" ] || [ ! -f "all-reference-$tag.json" ]; then
+              continue
+            fi
+            for step in verilate cppbuild execute; do
+              (cd rtlmeter && ./rtlmeter compare --format ascii --steps "$step" --metrics '*' \
+                "../all-reference-$tag.json" "../all-results-$tag.json") > "compare-$tag-$step.txt" || true
+              {
+                echo "### $tag: $step"
+                echo '```'
+                head -c 60000 "compare-$tag-$step.txt"
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+            done
+          done
+
+      - name: Upload results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          name: rtlmeter-arm-results
+          path: |
+            all-results-*.json
+            all-reference-*.json
+            compare-*.txt
+          if-no-files-found: warn
+          retention-days: 90

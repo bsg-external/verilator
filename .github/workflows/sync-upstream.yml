@@ -1,0 +1,44 @@
+---
+# FORK-ONLY FILE: merges upstream verilator/verilator master into this
+# fork's master once a day, keeping the fork-only workflow files.
+#
+# Needs a repository secret SYNC_TOKEN: a fine-grained personal access token
+# for this fork only, with Contents and Workflows set to read and write.
+# (The built-in token is not allowed to push changes to workflow files,
+# which upstream commits often contain.)
+
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork master
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          ref: master
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Merge upstream master and push
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "sync-bot"
+          git config user.email "sync-bot@users.noreply.github.com"
+          git remote add upstream https://github.com/verilator/verilator.git
+          git fetch upstream master
+          git merge --no-edit upstream/master
+          git push origin master

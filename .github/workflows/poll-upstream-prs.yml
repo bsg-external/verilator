@@ -1,0 +1,60 @@
+---
+# FORK-ONLY FILE: every 30 minutes, looks for open upstream PRs that carry
+# upstream's RTLMeter label, and starts rtlmeter-arm.yml for the first PR
+# head commit not measured yet. Runs one measurement at a time.
+#
+# Optional repository variable: ARM_PR_LABEL (default 'pr: rtlmeter').
+
+name: Poll upstream PRs
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: poll-upstream-prs
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      LABEL: "${{ vars.ARM_PR_LABEL || 'pr: rtlmeter' }}"
+    steps:
+      - name: Start the next unmeasured PR
+        shell: bash
+        run: |
+          set -euo pipefail
+          runs="$(gh run list --workflow rtlmeter-arm.yml --limit 500 \
+                    --json displayTitle,status,conclusion)"
+
+          # One measurement at a time
+          if jq -e 'any(.[]; .status != "completed")' <<< "$runs" > /dev/null; then
+            echo "An Arm RTLMeter run is still queued or running; nothing to do."
+            exit 0
+          fi
+
+          # Titles of runs that count as measured (cancelled runs and quick
+          # smoke tests do not count)
+          measured="$(jq -r '.[] | select(.conclusion != "cancelled") | .displayTitle
+                             | select(contains("(quick)") | not)' <<< "$runs")"
+
+          while read -r pr sha; do
+            [ -n "$sha" ] || continue
+            if ! grep -qF "$sha" <<< "$measured"; then
+              echo "Starting Arm RTLMeter for PR #$pr at $sha"
+              gh workflow run rtlmeter-arm.yml -f pr="$pr" -f sha="$sha"
+              exit 0
+            fi
+          done < <(gh pr list --repo verilator/verilator --base master --state open \
+                     --label "$LABEL" --limit 100 --json number,headRefOid \
+                     --jq '.[] | "\(.number) \(.headRefOid)"')
+
+          echo "Every open PR labelled '$LABEL' is already measured."
